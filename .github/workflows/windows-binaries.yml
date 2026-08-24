@@ -1,0 +1,32 @@
+name: Windows Binaries
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build release binaries
+    permissions:
+      contents: read
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Build release binaries
+        run: cargo build --release --locked -p cowchat-server -p cowchat-cli
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/windows -Force
+          Copy-Item target/release/cowchat.exe dist/windows/
+          Copy-Item target/release/cowchat-server.exe dist/windows/
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cowchat-windows-x86_64
+          path: dist/windows/
+          if-no-files-found: error
