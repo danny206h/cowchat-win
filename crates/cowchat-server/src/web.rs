@@ -129,22 +129,46 @@ fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
     else {
         return true;
     };
-    allowed.iter().any(|candidate| candidate == origin)
+
+    if allowed.iter().any(|candidate| candidate == origin) {
+        return true;
+    }
+
+    allowed.is_empty() && origin_matches_host(origin, headers)
+}
+
+fn origin_matches_host(origin: &str, headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(origin_host) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return false;
+    };
+    !origin_host.is_empty() && origin_host.eq_ignore_ascii_case(host)
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     if !origin_allowed(&headers, &state.allowed_origins) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+    let allow_keyless = peer.ip().is_loopback();
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, allow_keyless))
         .into_response()
 }
 
-async fn handle_ws_connection(ws: WebSocket, state: AppState) {
+async fn handle_ws_connection(ws: WebSocket, state: AppState, allow_keyless: bool) {
     let (mut ws_sender, mut ws_receiver) = ws.split();
 
     // Create an in-memory duplex stream (bidirectional pipe)
@@ -220,7 +244,7 @@ async fn handle_ws_connection(ws: WebSocket, state: AppState) {
             vote_mgr,
             api_key,
             no_auth,
-            false,
+            allow_keyless,
             rate_limiter,
             reconnect_mgr,
             task_mgr,
@@ -688,14 +712,21 @@ async fn download_blob(
 
 async fn static_handler(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
+    let path = if path.is_empty() || path == "dashboard.html" {
+        "index.html"
+    } else {
+        path
+    };
 
     match WebAssets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
                 content.data.into_owned(),
             )
                 .into_response()
@@ -705,7 +736,10 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             match WebAssets::get("index.html") {
                 Some(content) => (
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, "text/html".to_string())],
+                    [
+                        (header::CONTENT_TYPE, "text/html".to_string()),
+                        (header::CACHE_CONTROL, "no-store".to_string()),
+                    ],
                     content.data.into_owned(),
                 )
                     .into_response(),
@@ -806,6 +840,41 @@ mod tests {
         assert!(
             matches!(close, Some(Ok(ClientMessage::Close(_))) | None),
             "registration error must precede connection close, got {close:?}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn loopback_websocket_can_register_without_key() {
+        let (server, addr) = start_test_web_server(test_state()).await;
+        let (mut socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let register = Frame {
+            id: Some("keyless-loopback-registration".into()),
+            reply_to: None,
+            frame_type: FrameType::Register,
+            payload: serde_json::to_value(RegisterPayload {
+                key: String::new(),
+                agent_id: Some("keyless-web-agent".into()),
+                name: "keyless web".into(),
+                capabilities: vec!["web-ui".into()],
+                reconnect: false,
+                protocol_version: Some(cowchat_core::PROTOCOL_VERSION),
+            })
+            .unwrap(),
+        };
+        socket
+            .send(ClientMessage::Text(
+                register.to_line().unwrap().trim_end().to_owned().into(),
+            ))
+            .await
+            .unwrap();
+
+        let response = next_text_frame(&mut socket).await;
+        assert_eq!(response.frame_type, FrameType::Ok);
+        assert_eq!(
+            response.reply_to.as_deref(),
+            Some("keyless-loopback-registration")
         );
 
         server.abort();
@@ -1018,11 +1087,21 @@ mod tests {
             header::ORIGIN,
             HeaderValue::from_static("https://evil.example"),
         );
+        headers.insert(header::HOST, HeaderValue::from_static("cowchat.example"));
+        assert!(!origin_allowed(&headers, &[]));
         assert!(!origin_allowed(
             &headers,
             &["https://cowchat.example".into()]
         ));
         assert!(origin_allowed(&headers, &["https://evil.example".into()]));
+
+        let mut same_origin_headers = HeaderMap::new();
+        same_origin_headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:9230"),
+        );
+        same_origin_headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:9230"));
+        assert!(origin_allowed(&same_origin_headers, &[]));
     }
 
     #[test]
